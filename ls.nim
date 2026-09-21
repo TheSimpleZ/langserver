@@ -922,6 +922,18 @@ proc didCloseFile*(
 
   ls.openFiles.del uri
 
+proc resolvedProjectFile*(file: NlsFileInfo): string =
+  ## The project this document belongs to, or "" while that is still being
+  ## worked out or could not be.
+  if not file.projectFile.completed():
+    return ""
+  try:
+    file.projectFile.read()
+  except CatchableError:
+    # `completed` is checked above, so this cannot raise; the compiler cannot
+    # see that through the future's declared effects.
+    ""
+
 proc makeIdleFile*(
     ls: LanguageServer, file: NlsFileInfo
 ): Future[void] {.async: (raises: []).} =
@@ -1464,14 +1476,29 @@ proc removeIdleNimsuggests*(
     debug "Removing idle nimsuggest", project = project.file
     project.errorCallback = none(ProjectCallback)
 
-    let ns = await project.ns
-    for uri in ns.openFiles:
-      debug "Removing idle nimsuggest open file", uri = uri
-      let info = ls.openFiles.getOrDefault(uri)
-      if info != nil:
+    # The documents this project was serving, taken from the table that
+    # tracks them. A nimsuggest's own `openFiles` is filled in one place, with
+    # the URI that caused it to be created or restarted, and nothing ever
+    # takes an entry out: it misses every document opened after the first and
+    # keeps every one already closed. Reading it here asked for the file
+    # information of documents the server had let go of, which is how a
+    # closed document could stop this sweep dead.
+    var served: seq[NlsFileInfo]
+    for info in ls.openFiles.values:
+      if info.resolvedProjectFile == project.file:
+        served.add info
+
+    try:
+      for info in served:
+        debug "Removing idle nimsuggest open file", uri = info.textDocument.uri
         await ls.makeIdleFile(info)
-    project.stop()
-    ls.projectFiles.del(project.file)
+    finally:
+      # Whatever happened to the bookkeeping above, the project goes. One left
+      # in `projectFiles` after a sweep that did not finish is found idle again
+      # on the next tick, fails the same way, and the server spends the rest of
+      # its life retrying that one project instead of reaping anything.
+      project.stop()
+      ls.projectFiles.del(project.file)
 
     ls.showMessage(
       fmt"Nimsuggest for {project.file} was stopped because it was idle for too long",

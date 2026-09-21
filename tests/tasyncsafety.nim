@@ -1,5 +1,5 @@
 import
-  std/[options, os, tables, json],
+  std/[options, os, sets, tables, json],
   chronos,
   unittest2,
   ../[nimlangserver, ls, utils],
@@ -9,6 +9,10 @@ import
 
 # `lsp` alone would shadow the ServerMode.lsp enum value.
 import ../routes/lsp as lspRoutes
+
+# Only what dating a project's last command needs: `seconds` and the rest of
+# the duration helpers here are chronos'.
+from std/times import now, initDuration, `-`
 
 suite "Async safety":
   let cmdParams =
@@ -232,3 +236,72 @@ suite "Documents closed while a handler is suspended":
     # entry used to dereference nil.
     waitFor ls.didCloseFile(unknownUri).wait(30.seconds)
     check unknownUri notin ls.openFiles
+
+suite "Reaping an idle nimsuggest":
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let ls = main(cmdParams)
+  let client = newLspSocketClient()
+  waitFor client.connect("localhost", cmdParams.port)
+  client.registerNotification(
+    "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
+    "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
+  )
+  discard waitFor client.initialize(
+    LspInitializeParams %* {
+      "processId": %getCurrentProcessId(),
+      "rootUri": fixtureUri("projects/hw/"),
+      "capabilities":
+        {"window": {"workDoneProgress": false}, "workspace": {"configuration": true}},
+    }
+  )
+
+  let
+    helloWorldFile = "projects/hw/hw.nim"
+    helloWorldUri = fixtureUri(helloWorldFile)
+    helloWorldPath = uriToPath(helloWorldUri)
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
+
+  test "every open document of the project is made idle, and only those":
+    # The sweep used to walk the nimsuggest's own `openFiles`. That set is
+    # filled in one place, with the URI that caused the nimsuggest to be
+    # created, and nothing ever takes an entry out of it: it misses every
+    # document opened after the first and keeps every one already closed.
+    let textDocument = TextDocumentItem(
+      uri: helloWorldUri,
+      languageId: "nim",
+      version: 0,
+      text: readFile("tests" / helloWorldFile),
+    )
+    waitFor ls.didOpenFile(textDocument).wait(30.seconds)
+    let ns = waitFor ls.projectFiles[helloWorldPath].ns.wait(30.seconds)
+
+    # A second document of the same project, which nothing tracks on the
+    # nimsuggest because that nimsuggest is already up.
+    let secondUri = fixtureUri("projects/hw/useRoot.nim")
+    let secondProject =
+      Future[string].Raising([CancelledError, OSError, RegexError]).init("second")
+    secondProject.complete(helloWorldPath)
+    ls.openFiles[secondUri] = NlsFileInfo(
+      projectFile: secondProject,
+      changed: false,
+      fingerTable: @[],
+      textDocument:
+        TextDocumentItem(uri: secondUri, languageId: "nim", version: 0, text: ""),
+    )
+
+    # And a document the nimsuggest still tracks although it was closed.
+    let closedUri = fixtureUri("projects/hw/declaration.nim")
+    ns.openFiles.incl closedUri
+    check closedUri notin ls.openFiles
+
+    ls.projectFiles[helloWorldPath].lastCmdDate = some(now() - initDuration(hours = 1))
+    waitFor ls.removeIdleNimsuggests().wait(30.seconds)
+
+    check helloWorldPath notin ls.projectFiles
+    check helloWorldUri in ls.idleOpenFiles
+    check secondUri in ls.idleOpenFiles
+    check secondUri notin ls.openFiles
+    check closedUri notin ls.idleOpenFiles
