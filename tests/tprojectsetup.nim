@@ -123,3 +123,51 @@ suite "Project Mapping":
     let expectedProjectFile = nonimbleProject
 
     check projectFile == expectedProjectFile
+
+suite "Resolving against the nimsuggests already running":
+  let cmdParams =
+    CommandLineParams(mode: some lsp, transport: some socket, port: getNextFreePort())
+  let ls = main(cmdParams)
+  let client = newLspSocketClient()
+  waitFor client.connect("localhost", cmdParams.port)
+  client.registerNotification(
+    "window/showMessage", "window/workDoneProgress/create", "workspace/configuration",
+    "extension/statusUpdate", "textDocument/publishDiagnostics", "$/progress",
+  )
+  let projectsDir = absolutePath "tests" / "projects"
+
+  suiteTeardown:
+    waitFor ls.stopNimsuggestProcesses()
+
+  test "a file a running project knows goes to that project, not a new one":
+    # `slowroot/other.nim` is imported by `slowroot/mappedroot.nim` and by
+    # nothing else. The guess cannot know that: it looks for a module named
+    # after a parent directory, finds `slowroot/slowroot.nim`, and hands the
+    # file to a project that never compiled it.
+    discard waitFor client.initialize(
+      LspInitializeParams %* {
+        "processId": %getCurrentProcessId(),
+        "rootUri": fixtureUri("projects"),
+        "capabilities":
+          {"window": {"workDoneProgress": false}, "workspace": {"configuration": true}},
+      }
+    )
+    # Unlimited processes, so the fallback that reuses the first project
+    # cannot be what makes this pass.
+    ls.setWorkspaceConfiguration(
+      %(@[NlsConfig(maxNimsuggestProcesses: some 0, autoCheckFile: some false)])
+    )
+
+    let
+      mappedRoot = projectsDir / "slowroot" / "mappedroot.nim"
+      other = projectsDir / "slowroot" / "other.nim"
+      slowRoot = projectsDir / "slowroot" / "slowroot.nim"
+
+    waitFor ls.createOrRestartNimsuggest(mappedRoot).wait(60.seconds)
+    check waitUntil(mappedRoot in ls.projectFiles, timeout = 60.seconds)
+    discard waitFor ls.projectFiles[mappedRoot].ns.wait(60.seconds)
+
+    let projectFile = waitFor getProjectFile(other, ls).wait(60.seconds)
+    check projectFile == mappedRoot
+    check projectFile != slowRoot
+    check projectFile != other

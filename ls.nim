@@ -1364,6 +1364,24 @@ proc getProjectFile*(
       trace "getProjectFile does not match",
         uri = fileUri, matchedRegex = mapping.fileRegex
 
+  # A nimsuggest that is already running and already knows this file is a
+  # better answer than a new one, and the guess below cannot find it: that
+  # guess only looks for a module named after one of the file's parent
+  # directories. A package whose modules are not all reachable from one root
+  # has files that match no such name, and each of them would otherwise
+  # become a project, and a process, of its own.
+  for projectFile in ls.projectFiles.keys.toSeq:
+    let running = ls.projectFiles.getOrDefault(projectFile)
+    if running.isNil or not running.ns.completed():
+      continue # still starting: asking it would mean waiting for the compile
+    let ns = await running.ns
+    if not ns.canHandleUnknown:
+      continue # it cannot tell us either way
+    if await ns.isKnown(fileUri):
+      debug "Reusing the nimsuggest that knows this file",
+        project = projectFile, uri = fileUri
+      return projectFile
+
   #If we reached the maximum instances of nimsuggest, we just return the first project
   let shouldSpawn = await ls.shouldSpawnNimsuggest()
   if not shouldSpawn:
