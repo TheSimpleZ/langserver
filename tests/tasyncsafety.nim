@@ -232,3 +232,24 @@ suite "Documents closed while a handler is suspended":
     # entry used to dereference nil.
     waitFor ls.didCloseFile(unknownUri).wait(30.seconds)
     check unknownUri notin ls.openFiles
+
+suite "Waiting without cancelling":
+  proc completeAfter(delay: Duration): Future[void] {.async: (raises: []).} =
+    try:
+      await sleepAsync(delay)
+    except CancelledError:
+      discard
+
+  test "a future that beats the deadline reports so":
+    let work = completeAfter(chronos.milliseconds(20))
+    check waitFor work.finishesWithin(chronos.milliseconds(2000))
+    check work.completed
+
+  test "a future that misses the deadline is left running, not cancelled":
+    let work = completeAfter(chronos.milliseconds(400))
+    check not waitFor work.finishesWithin(chronos.milliseconds(20))
+    # The point of the whole exercise: it is still going.
+    check not work.finished
+    check not work.cancelled
+    waitFor work.wait(5.seconds)
+    check work.completed

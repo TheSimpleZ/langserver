@@ -1193,12 +1193,9 @@ proc createOrRestartNimsuggestImpl(
       configuration.logNimsuggest.get(false),
       configuration.exceptionHintsEnabled,
     )
-    if not await chronos.withTimeout(
-      projectFut, chronos.milliseconds(NIMSUGGEST_STARTUP_TIMEOUT)
-    ):
-      error "Nimsuggest startup timed out", projectFile = projectFile
-      return
-
+    # However long the project takes to compile is how long this waits. The
+    # caller is not kept waiting with it: `createOrRestartNimsuggest` stops
+    # watching after its own deadline and this carries on.
     let projectNext = await projectFut
     if projectFile in ls.projectFiles:
       var project = ls.projectFiles[projectFile]
@@ -1231,6 +1228,20 @@ proc createOrRestartNimsuggestImpl(
     error "Failed to create/restart nimsuggest",
       projectFile = projectFile, error = getCurrentExceptionMsg()
 
+proc finishesWithin*(
+    fut: Future[void].Raising([]), timeout: chronos.Duration
+): Future[bool] {.async: (raises: []).} =
+  ## `withTimeout` without the part where it cancels what it was waiting for.
+  ## Whatever `fut` is doing carries on; only the waiting stops.
+  let waiter = Future[void].Raising([CancelledError]).init("finishesWithin")
+  fut.addCallback do(data: pointer) {.raises: [], gcsafe.}:
+    if not waiter.finished:
+      waiter.complete()
+  try:
+    await chronos.withTimeout(waiter, timeout)
+  except CancelledError:
+    false
+
 proc createOrRestartNimsuggest*(
     ls: LanguageServer, projectFile: string, uri = ""
 ): Future[void] {.async: (raises: []).} =
@@ -1241,9 +1252,19 @@ proc createOrRestartNimsuggest*(
 
   let creation = ls.createOrRestartNimsuggestImpl(projectFile, uri)
   ls.nimsuggestCreations[projectFile] = creation
-  await creation
-  if ls.nimsuggestCreations.getOrDefault(projectFile) == creation:
-    ls.nimsuggestCreations.del(projectFile)
+  creation.addCallback do(data: pointer) {.raises: [], gcsafe.}:
+    if ls.nimsuggestCreations.getOrDefault(projectFile) == creation:
+      ls.nimsuggestCreations.del(projectFile)
+
+  # How long a project takes to compile is the project's business. Waiting for
+  # it is this server's, and that is what has a deadline: a project still
+  # starting when the deadline passes keeps starting, and takes its place when
+  # it is ready, rather than being killed for being large.
+  if not await creation.finishesWithin(
+    chronos.milliseconds(NIMSUGGEST_STARTUP_TIMEOUT)
+  ):
+    info "Nimsuggest is still starting; it will be used once it is ready",
+      projectFile = projectFile
 
 proc restartAllNimsuggestInstances(
     ls: LanguageServer
